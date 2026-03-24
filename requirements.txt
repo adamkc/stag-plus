@@ -14,3 +14,7 @@ tkinter-tooltip
 # Added for IQ/Aesthetics
 numpy
 scipy
+pyiqa
+fairscale
+transformers<4.50
+timm

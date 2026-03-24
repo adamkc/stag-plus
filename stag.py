@@ -19,9 +19,7 @@ UPSTREAM_VERSION = "1.0.2"
 import numpy as np
 import rawpy
 import torch
-import torch.nn as nn
 import torchvision.transforms as transforms
-import torchvision.models as models
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -60,8 +58,23 @@ def _score_to_bin(score: float, n_bins: int = 3) -> str:
 
 
 def _score_to_stars(score: float) -> int:
-    """Map a normalised 0-1 score to 1-5 stars."""
-    return max(1, min(5, int(score * 5) + 1))
+    """
+    Map a normalised 0-1 aesthetic score to 1-5 stars.
+
+    NIMA scores for typical photos cluster in the 0.25-0.55 range,
+    so we use percentile-based thresholds rather than uniform bins
+    to get a useful star distribution.
+    """
+    if score < 0.28:
+        return 1
+    elif score < 0.33:
+        return 2
+    elif score < 0.40:
+        return 3
+    elif score < 0.50:
+        return 4
+    else:
+        return 5
 
 
 # ---------------------------------------------------------------------------
@@ -181,62 +194,41 @@ def compute_brisque_score(pil_image: Image.Image) -> float:
 
 # ---------------------------------------------------------------------------
 # NIMA – Neural Image Assessment (aesthetic scoring)
-#   Uses MobileNetV2 backbone trained on AVA dataset.
-#   Predicts a distribution over 1-10 aesthetic ratings.
+#   Uses PyIQA's pretrained NIMA (InceptionV2, trained on AVA dataset).
+#   Predicts aesthetic quality on a 1-10 scale.
+#   Weights auto-downloaded from HuggingFace on first run (~208 MB).
 # ---------------------------------------------------------------------------
 
-class NimaModel(nn.Module):
-    """NIMA model with MobileNetV2 backbone."""
-
-    def __init__(self):
-        super().__init__()
-        base = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-        self.features = base.features
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.75),
-            nn.Linear(1280, 10),
-            nn.Softmax(dim=1),
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
-
-
-def _nima_transform():
-    """Image transform for NIMA input."""
-    return transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-
-
-def compute_nima_score(pil_image: Image.Image, model: nn.Module, device: torch.device) -> float:
+def create_nima_model(device: torch.device):
     """
-    Compute NIMA aesthetic score.
+    Create a pretrained NIMA model using PyIQA.
+
+    Returns:
+        PyIQA metric object ready for inference.
+    """
+    import pyiqa
+    return pyiqa.create_metric('nima', device=device)
+
+
+def compute_nima_score(pil_image: Image.Image, model, device: torch.device) -> float:
+    """
+    Compute NIMA aesthetic score using PyIQA's AVA-trained model.
 
     Returns:
         Float in [0, 1] where 1 = most aesthetically pleasing.
     """
-    transform = _nima_transform()
     img = pil_image.convert("RGB")
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
     tensor = transform(img).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        probs = model(tensor).cpu().numpy()[0]
-
-    # Weighted mean over the 1-10 distribution
-    scores = np.arange(1, 11, dtype=np.float64)
-    mean_score = float(np.sum(probs * scores))
+        raw_score = model(tensor).item()  # 1-10 scale
 
     # Normalise from [1, 10] range to [0, 1]
-    normalised = (mean_score - 1.0) / 9.0
+    normalised = (raw_score - 1.0) / 9.0
     return float(np.clip(normalised, 0.0, 1.0))
 
 
@@ -301,12 +293,10 @@ class SKTagger:
             self.model = None
             self.transform = None
 
-        # Load NIMA aesthetic model
+        # Load NIMA aesthetic model (PyIQA, AVA-trained)
         if self.enable_aes:
-            self.nima_model = NimaModel()
-            self.nima_model.eval()
-            self.nima_model = self.nima_model.to(self.device)
-            print("NIMA aesthetic model loaded (MobileNetV2 backbone, ImageNet weights).")
+            self.nima_model = create_nima_model(self.device)
+            print("NIMA aesthetic model loaded (InceptionV2, AVA-trained via PyIQA).")
         else:
             self.nima_model = None
 

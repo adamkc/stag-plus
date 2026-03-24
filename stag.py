@@ -42,19 +42,37 @@ raw_extensions = [
 # IQ / Aesthetic scoring helpers
 # ---------------------------------------------------------------------------
 
-def _score_to_bin(score: float, n_bins: int = 3) -> str:
+def _score_to_bin(score: float, n_bins: int = 3, metric: str = "iq") -> str:
     """
     Map a normalised 0-1 score to a named quality bin.
+
+    For IQ scores, uniform thresholds work well since the range is wide.
+    For AES scores, percentile-based thresholds are used to match the
+    star rating distribution (NIMA scores cluster in 0.25-0.55).
 
     3-bin:  low / medium / high
     5-bin:  poor / below_average / average / good / excellent
     """
-    if n_bins == 5:
-        names = ["poor", "below_average", "average", "good", "excellent"]
+    if metric == "aes":
+        # Percentile-based thresholds aligned with star ratings
+        if n_bins == 5:
+            if score < 0.28:   return "poor"
+            if score < 0.33:   return "below_average"
+            if score < 0.40:   return "average"
+            if score < 0.50:   return "good"
+            return "excellent"
+        else:
+            if score < 0.33:   return "low"
+            if score < 0.45:   return "medium"
+            return "high"
     else:
-        names = ["low", "medium", "high"]
-    idx = min(int(score * n_bins), n_bins - 1)
-    return names[idx]
+        # IQ: uniform thresholds
+        if n_bins == 5:
+            names = ["poor", "below_average", "average", "good", "excellent"]
+        else:
+            names = ["low", "medium", "high"]
+        idx = min(int(score * n_bins), n_bins - 1)
+        return names[idx]
 
 
 def _score_to_stars(score: float) -> int:
@@ -355,6 +373,9 @@ class SKTagger:
             return False
 
         for current_file in sidecar_files:
+            # Skip __create__ markers (RAW partner needing sidecar)
+            if isinstance(current_file, tuple):
+                continue
             handler = XMPHandler(current_file)
 
             # Check RAM+ tags
@@ -398,17 +419,49 @@ class SKTagger:
         if not has_anything:
             return
 
-        # Create sidecar file if none exists
-        if len(sidecar_files) == 0:
+        # Resolve sidecar list: create any missing sidecars (for the image
+        # itself and for RAW partners flagged with __create__).
+        resolved = []
+        for entry in sidecar_files:
+            if isinstance(entry, tuple) and entry[0] == "__create__":
+                # RAW partner needs a sidecar created
+                if not self.test_mode:
+                    raw_path = entry[1]
+                    new_sc = XMPHandler.create_xmp_sidecar(raw_path, self.prefer_exact_filenames)
+                    resolved.append(new_sc)
+            else:
+                resolved.append(entry)
+
+        # Also ensure the image's own sidecar exists (important for JPG+RAW
+        # pairs where the JPG may not have had a sidecar yet)
+        own_sidecars = XMPHandler.get_xmp_sidecars_for_image(image_file)
+        if not own_sidecars and not any(
+            s for s in resolved
+            if not isinstance(s, tuple) and os.path.basename(image_file).lower() in s.lower()
+        ):
             if not self.test_mode:
-                sidecar_files = [XMPHandler.create_xmp_sidecar(image_file, self.prefer_exact_filenames)]
+                new_sc = XMPHandler.create_xmp_sidecar(image_file, self.prefer_exact_filenames)
+                resolved.insert(0, new_sc)
+
+        if not resolved:
+            if not self.test_mode:
+                resolved = [XMPHandler.create_xmp_sidecar(image_file, self.prefer_exact_filenames)]
             else:
                 print("Skipping XMP file creation, not writing tags")
                 return
 
+        sidecar_files = resolved
+
         # Write to all sidecar files
         for current_file in sidecar_files:
             handler = XMPHandler(current_file)
+
+            # Clear old IQ/AES bin tags before writing new ones.
+            # This prevents stacking duplicate bins on --force re-runs.
+            if iq_score is not None:
+                handler.remove_subjects_by_prefix("iq")
+            if aes_score is not None:
+                handler.remove_subjects_by_prefix("aes")
 
             # Content tags from RAM+
             for tag in tags:
@@ -419,12 +472,12 @@ class SKTagger:
 
             # IQ tags
             if iq_score is not None:
-                iq_bin = _score_to_bin(iq_score, self.n_bins)
+                iq_bin = _score_to_bin(iq_score, self.n_bins, metric="iq")
                 handler.add_hierarchical_subject(f"iq|{iq_bin}")
 
             # Aesthetic tags + star rating
             if aes_score is not None:
-                aes_bin = _score_to_bin(aes_score, self.n_bins)
+                aes_bin = _score_to_bin(aes_score, self.n_bins, metric="aes")
                 handler.add_hierarchical_subject(f"aes|{aes_bin}")
                 if self.write_stars:
                     stars = _score_to_stars(aes_score)
@@ -448,8 +501,44 @@ class SKTagger:
         processed = 0
         skipped = 0
 
+        # Count total processable files for progress reporting
+        total_files = 0
+        for _, _, fl in os.walk(img_dir):
+            jpg_bases = set()
+            for fn in fl:
+                b, e = os.path.splitext(fn)
+                if e.lower() in ('.jpg', '.jpeg', '.png', '.tiff', '.tif'):
+                    jpg_bases.add(b.lower())
+            for fn in fl:
+                b, e = os.path.splitext(fn)
+                if fn.startswith(".") or e.lower() == ".xmp":
+                    continue
+                if e.lower() in raw_extensions and b.lower() in jpg_bases:
+                    continue
+                total_files += 1
+        print(f"Total images to check: {total_files}")
+
+        current_idx = 0
+
         for current_dir, _, file_list in os.walk(img_dir):
-            for fname in sorted(file_list):
+            # Build a set of basenames (without extension) that have a JPG variant.
+            # When both image.JPG and image.ORF exist, skip the RAW — the JPG is
+            # faster to decode and they share the same XMP sidecar.
+            sorted_files = sorted(file_list)
+            jpg_basenames = set()
+            for fn in sorted_files:
+                base, ext = os.path.splitext(fn)
+                if ext.lower() in ('.jpg', '.jpeg', '.png', '.tiff', '.tif'):
+                    jpg_basenames.add(base.lower())
+
+            # Also build a map of basename -> list of RAW filenames for partner lookup
+            raw_partners = {}
+            for fn in sorted_files:
+                base, ext = os.path.splitext(fn)
+                if ext.lower() in raw_extensions:
+                    raw_partners.setdefault(base.lower(), []).append(fn)
+
+            for fname in sorted_files:
                 if stop_event.is_set():
                     print("Processing cancelled.")
                     return
@@ -457,8 +546,25 @@ class SKTagger:
                 if fname.startswith("."):
                     continue
 
+                # Skip RAW files when a JPG with the same basename exists
+                base, ext = os.path.splitext(fname)
+                if ext.lower() in raw_extensions and base.lower() in jpg_basenames:
+                    continue
+
                 image_file = os.path.join(current_dir, fname)
                 sidecar_files = XMPHandler.get_xmp_sidecars_for_image(image_file)
+
+                # If this is a JPG with RAW partners, also collect/create their sidecars
+                if ext.lower() in ('.jpg', '.jpeg', '.png', '.tiff', '.tif'):
+                    for raw_fn in raw_partners.get(base.lower(), []):
+                        raw_path = os.path.join(current_dir, raw_fn)
+                        raw_sidecars = XMPHandler.get_xmp_sidecars_for_image(raw_path)
+                        sidecar_files.extend(raw_sidecars)
+                        # Remember the RAW path so save_tags can create its sidecar if needed
+                        if not raw_sidecars:
+                            sidecar_files.append(("__create__", raw_path))
+
+                current_idx += 1
 
                 if self.is_already_tagged(sidecar_files):
                     skipped += 1
@@ -467,7 +573,7 @@ class SKTagger:
                 image, loader = self.load_image(image_file)
 
                 if image is not None:
-                    print(f'Processing {image_file} ({loader}):')
+                    print(f'[{current_idx}/{total_files}] {image_file} ({loader}):')
 
                     # --- RAM+ tagging ---
                     tags = []
@@ -481,16 +587,16 @@ class SKTagger:
                     iq_score = None
                     if self.enable_iq:
                         iq_score = compute_brisque_score(image)
-                        iq_bin = _score_to_bin(iq_score, self.n_bins)
+                        iq_bin = _score_to_bin(iq_score, self.n_bins, metric="iq")
                         print(f"  IQ: {iq_score:.3f} -> {iq_bin}")
 
                     # --- Aesthetic assessment ---
                     aes_score = None
                     if self.enable_aes:
                         aes_score = compute_nima_score(image, self.nima_model, self.device)
-                        aes_bin = _score_to_bin(aes_score, self.n_bins)
+                        aes_bin = _score_to_bin(aes_score, self.n_bins, metric="aes")
                         stars = _score_to_stars(aes_score) if self.write_stars else None
-                        star_str = f" ({stars}★)" if stars else ""
+                        star_str = f" ({stars}*)" if stars else ""
                         print(f"  Aesthetics: {aes_score:.3f} -> {aes_bin}{star_str}")
 
                     # --- Save everything ---

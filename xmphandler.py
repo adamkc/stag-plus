@@ -153,6 +153,40 @@ class XMPHandler:
         new_tag.string = new_subject
         subjects_container.append(new_tag)
 
+    def remove_subjects_by_prefix(self, prefix: str) -> None:
+        """
+        Remove all subjects and hierarchical subjects that start with a given prefix.
+
+        Used to clear old iq|/aes| bin tags before writing updated ones,
+        so --force doesn't stack duplicate bins.
+
+        Args:
+            prefix: The prefix to match (e.g. "iq", "aes")
+        """
+        # Remove from hierarchical subjects
+        hs_container = self._get_container(self.hierarchical_subject)
+        if hs_container:
+            for item in list(hs_container("rdf:li")):
+                if item.string and item.string.startswith(prefix + "|"):
+                    item.decompose()
+
+        # Remove from regular subjects
+        subjects_container = self._get_container(self.subject)
+        if subjects_container:
+            # Collect bin names used by iq/aes so we only remove those
+            bin_names = {"low", "medium", "high", "poor", "below_average",
+                         "average", "good", "excellent"}
+            for item in list(subjects_container("rdf:li")):
+                if item.string and (item.string == prefix or item.string in bin_names):
+                    # Only remove bin-name subjects if they came from this prefix.
+                    # The prefix itself (e.g. "iq") is always safe to remove.
+                    if item.string == prefix:
+                        item.decompose()
+                    # For bin names, only remove if the hierarchical version existed
+                    # (we already removed those above, so just remove the leaf too)
+                    elif item.string in bin_names:
+                        item.decompose()
+
     def add_hierarchical_subject(self, hs: str) -> None:
         """Add a hierarchical subject and its components"""
         hs_container = self._get_container(self.hierarchical_subject)

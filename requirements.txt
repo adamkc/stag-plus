@@ -1,0 +1,16 @@
+# STAG+ dependencies
+# Core (from upstream STAG)
+torch
+torchvision
+Pillow
+pillow-heif
+rawpy
+beautifulsoup4
+lxml
+huggingface_hub
+recognize-anything @ git+https://github.com/xinyu1205/recognize-anything.git
+tkinter-tooltip
+
+# Added for IQ/Aesthetics
+numpy
+scipy

@@ -502,16 +502,18 @@ class SKTagger:
         skipped = 0
 
         # Count total processable files for progress reporting
+        image_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.heif', '.heic'}
+        all_image_exts = image_extensions | set(raw_extensions)
         total_files = 0
         for _, _, fl in os.walk(img_dir):
             jpg_bases = set()
             for fn in fl:
                 b, e = os.path.splitext(fn)
-                if e.lower() in ('.jpg', '.jpeg', '.png', '.tiff', '.tif'):
+                if e.lower() in image_extensions:
                     jpg_bases.add(b.lower())
             for fn in fl:
                 b, e = os.path.splitext(fn)
-                if fn.startswith(".") or e.lower() == ".xmp":
+                if fn.startswith(".") or e.lower() not in all_image_exts:
                     continue
                 if e.lower() in raw_extensions and b.lower() in jpg_bases:
                     continue
@@ -546,8 +548,13 @@ class SKTagger:
                 if fname.startswith("."):
                     continue
 
-                # Skip RAW files when a JPG with the same basename exists
                 base, ext = os.path.splitext(fname)
+
+                # Skip non-image files (XMP sidecars, etc.)
+                if ext.lower() not in all_image_exts:
+                    continue
+
+                # Skip RAW files when a JPG with the same basename exists
                 if ext.lower() in raw_extensions and base.lower() in jpg_basenames:
                     continue
 
